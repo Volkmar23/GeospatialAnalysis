@@ -3,3 +3,16 @@
 token.txt
 readme_Descargas.txt
 .zip
+
+
+.shp
+.tif
+.csv
+.dbf
+.nc
+.h5
+
+cache/
+databases/
+GEE_Landslide_Pipelines/
+Descargas/

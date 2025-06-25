@@ -6,9 +6,10 @@ import re
 import time
 import sys
 import cftime
-import matplotlib.pyplot as plt
-import seaborn as sns
 from datetime import datetime, timedelta
+import rioxarray as rio
+import rasterio
+from  .reproject import create_climate_geotiffs_from_dict
 
 
 # Define paths
@@ -21,8 +22,6 @@ if path_tools not in sys.path:
 # Import your modules
 import tools
 from terrain_assigment import calcular_terreno_puntos
-
-
 
 def longest_streak_above_threshold(data, threshold):
     """
@@ -99,17 +98,23 @@ def has_all_days(date_series: np.array,
 
     return is_equal
 
-def common_clip(file_name :str, bbox=None):
-    
-    current_xr = xr.open_dataset(file_name, chunks={'time':'auto'})    
-    current_xr = current_xr.assign_coords(**{'lon':tools.convert_longitude_to_minus180_to_180(current_xr['lon'])})
-    current_xr = tools.regular_slice(xr_file=current_xr,
-                                     country_bounds=bbox,
-                                     lon_name='lon',
-                                     lat_name='lat'
-                                    )
+def common_clip(path_name,
+                bbox,
+                lon_name,
+                lat_name):
 
-    return current_xr
+    if isinstance(path_name,str):
+        xarray_file = xr.open_dataset(path_name, chunks={'time':'auto'})
+    else:
+        xarray_file = path_name
+        
+    xarray_file = xarray_file.sortby( variables= ['lat', 'lon'] ,ascending=[False, True] , )
+    slice_array = xarray_file.sel({lon_name: slice(bbox['lon_min'], bbox['lon_max']),
+                                     lat_name: slice(bbox['lat_min'], bbox['lat_max'])}
+                                 ) 
+
+    return slice_array
+
 
 
 def create_df_modelos(url_nasa: str,
@@ -129,6 +134,9 @@ def create_df_modelos(url_nasa: str,
                  'vector_lat':None
                 }
 
+    
+    dataset_assigment = assets.copy()
+    
     re_nasa_pattern = r"SAM_pr_(?P<Modelos>.+?)_(?P<Escenarios>historical|ssp\d+)_(?P<Fold>\d+).nc$"
     modelos_regex = re.compile(re_nasa_pattern)
     np_arr = np.array([var for var in os.listdir(url_nasa) if modelos_regex.match(var)])
@@ -139,24 +147,48 @@ def create_df_modelos(url_nasa: str,
     first_coord = True
     bad_ones = False
 
+    database_name = 'idx_affine'
+
     for modelo, df in mod_esc:
 
         raw_idx = df.index
-        files_txt = np_arr[raw_idx]
-
+        files_txt = np_arr[raw_idx]       
         path_name = os.path.join(url_nasa, files_txt[0])
         xarray_file = xr.open_dataset(path_name, chunks={'time':'auto'})
+        
 
         if not extracted_coords:
-            current_xr = common_clip(path_name, bbox)
-            (slice_tuple, cols_dict_db, dataset_assigment  ,dim_mapping ) = tools.extract_slice_tools(nc_file=current_xr,
-                                                                                                        dataset=assets,
-                                                                                                        database_name='lon_lat',
-                                                                                                        column_isa=['Longitud','Latitud'], 
-                                                                                                        variable_name='pr',
-                                                                                                        dim_bool=True)
+
+            lon_name = tools.get_coord_name(xarray_file, 'lon')
+            lat_name = tools.get_coord_name(xarray_file, 'lat')
+
+            catche_affine = common_clip(path_name = xarray_file ,
+                                            bbox = bbox,
+                                            lon_name = lon_name,
+                                            lat_name = lat_name)
+                                
+
+            slice_lon = catche_affine.lon.values
+            slice_lat = catche_affine.lat.values
+    
+            in_memory = catche_affine.compute()
+            affine = in_memory.rio.transform()
             
+            rows, cols = rasterio.transform.rowcol(affine, dataset_assigment.get('Longitud_360').values, dataset_assigment.Latitud.values)
+            idx_affine = [f"{row}_{col}" for   row,col in zip(rows,cols)]
+            
+            dataset_assigment.loc[:, database_name] =  idx_affine
+            dataset_assigment.loc[:, 'row'] = rows
+            dataset_assigment.loc[:, 'col'] = cols
+
+            no_duplicates = dataset_assigment.drop_duplicates(subset = database_name).copy()
+            no_duplicates.loc[:, ['lon', 'lat']] = no_duplicates.get(database_name).str.extract(r"(?P<lon>\d+)_(?P<lat>\d+)").astype(int)
+
+            cols_dict_db = list(no_duplicates.get(database_name).values)
+            rows_unique, cols_unique = no_duplicates.row.values, no_duplicates.col.values
+    
             extracted_coords = True
+  
 
         vector_lon = xarray_file.lon.values
         vector_lat = xarray_file.lat.values
@@ -184,13 +216,22 @@ def create_df_modelos(url_nasa: str,
 
     np_arr = np.array([os.path.join(url_nasa, name_file) for name_file in np_arr])
 
-    coords_dict = {'slice_tuple':slice_tuple,
-                   'cols_dict_db': cols_dict_db,
+    coords_dict = {
+                   'row': rows_unique,
+                   'col': cols_unique,
+                   'cols_dict_db' : cols_dict_db,
                    'dataset_assigment': dataset_assigment,
-                   'dim_mapping':dim_mapping
-                }
+        
+                   'affine':affine ,
+                   'lon': slice_lon ,
+                   'lat': slice_lat ,
+        
+                   'lon_name': lon_name ,
+                   'lat_name': lat_name
+                   }
     
     if not bad_ones:
+        
         print("All share the same coords")
         return (modelos, np_arr, coords_dict)
     else:
@@ -199,22 +240,22 @@ def create_df_modelos(url_nasa: str,
 
 def ensamble_folds(bbox=None,
                    list_names=None,
-                   non_leap_year=True):
+                   non_leap_year=True,
+                   lon_name = str,
+                   lat_name = str
+                  ):
     """
     bbox -> UNION(str,tuple)
 
     str available : 
         - 'Colombia'
-        - 'Peru'
-        - 'Brasil'
-        - 'Bolivia'
-        - 'Chile'
     """
     
     cast_xarray = []
 
     for idx, file_name in enumerate(list_names, start=1):
-        current_xr = common_clip(file_name, bbox)        
+
+        current_xr = common_clip(file_name, bbox,lon_name,lat_name)        
         cast_xarray.append(current_xr)
         
     coords_time = [raw_mod.time.values for raw_mod in cast_xarray]
@@ -228,8 +269,11 @@ def ensamble_folds(bbox=None,
         return False
 
 
-## def rain_test(url_nsa: str, assets: pd.DataFrame, path_storage: str) -> None:
-def main(url_nsa: str, assets: pd.DataFrame, path_storage: str) -> None:
+## def rain_test(url_nsa: str, assets: pd.DataFrame, output_directory: str) -> None:
+def main(url_nsa: str,
+         assets: pd.DataFrame,
+         output_directory: str) -> None:
+    
     """
     Calcula índices de precipitación para escenarios históricos y futuros.
     
@@ -239,7 +283,7 @@ def main(url_nsa: str, assets: pd.DataFrame, path_storage: str) -> None:
         Ruta al directorio con archivos de datos climáticos
     assets : pd.DataFrame
         DataFrame con coordenadas de activos/puntos a analizar
-    path_storage : str
+    output_directory : str
         Ruta donde se guardarán los resultados
         
     Returns
@@ -251,12 +295,31 @@ def main(url_nsa: str, assets: pd.DataFrame, path_storage: str) -> None:
     
     # Configurar logging
     logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    logger = logging.getLogger(__name__)
+                        level=logging.INFO,
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+                    )
+
+    holgura = 1
     
-    logger.info(f"Iniciando procesamiento. Archivos en directorio destino: {len(os.listdir(path_storage))}")
+    lon_min = tools.map_to_0_to_360(tools.boundaries['Colombia']['lon_min'] -  holgura) 
+    lon_max = tools.map_to_0_to_360(tools.boundaries['Colombia']['lon_max'] + holgura)
+
+    lat_min = tools.boundaries['Colombia']['lat_min'] - holgura
+    lat_max = tools.boundaries['Colombia']['lat_max'] + holgura
+
+    assets['Longitud_360'] = tools.map_to_0_to_360(assets['Longitud'])
+
+    
+    slice_crops = {
+                    'lon_min' : lon_min,
+                    'lon_max' : lon_max,
+                    'lat_min' : lat_min,
+                    'lat_max' : lat_max
+                }
+
+    
+    logger = logging.getLogger(__name__)
+    ## logger.info(f"Iniciando procesamiento. Archivos en directorio destino: {len(os.listdir(output_directory))}")
     
     # Constantes
     PRECIPITATION_CONVERSION_FACTOR = 86_400  # Convertir de kg/m2/s a mm/día
@@ -270,28 +333,29 @@ def main(url_nsa: str, assets: pd.DataFrame, path_storage: str) -> None:
     # Ejemplo de uso
     ruta_dem = r'C:\Users\Usuario\OneDrive - INTERCONEXION ELECTRICA S.A. E.S.P\01_CC_DOC\data\06_InputGeologico\01_opentopography_SRTMGL1\01_DEM\Colombia\dem_Colombia_SRTM.tif'
 
-
     # Crear dataframe base con modelos y escenarios
     logger.info("Creando dataframe de modelos y escenarios")
-    modelos_result = create_df_modelos(url_nasa=url_nsa, 
-                                     assets=assets,
-                                     bbox='Colombia')
-    
-    if modelos_result is None:
-        logger.error("Error al crear dataframe de modelos. Coordenadas no alineadas.")
-        return None
+
+    modelos_result = create_df_modelos(url_nasa = url_nsa, 
+                                       assets = assets,
+                                       bbox = slice_crops
+                                      )
         
     modelos, np_arr, coords_dict = modelos_result
 
     # Extraer información de cortes espaciales
-    slice_tuple = coords_dict['slice_tuple']
-    slice_tuple_2d = slice_tuple[1:]
-    cols_dict_db = coords_dict['cols_dict_db']
+    col = coords_dict['col']
+    row = coords_dict['row']
 
+    lon_name = coords_dict['lon_name']
+    lat_name = coords_dict['lat_name']
     
-    dataset_assigment = coords_dict['dataset_assigment']
-    dim_mapping = coords_dict['dim_mapping']
+    lon_coords = coords_dict['lon']
+    lat_coords = coords_dict['lat']
+    affine = coords_dict['affine']
 
+    cols_dict_db = coords_dict['cols_dict_db']    
+    dataset_assigment = coords_dict['dataset_assigment']
 
     # Enriquecer dataset con susceptibilidad NASA
     logger.info("Aplicando susceptibilidad NASA a los activos")
@@ -305,11 +369,11 @@ def main(url_nsa: str, assets: pd.DataFrame, path_storage: str) -> None:
     
     # Mapeo de escenarios
     maper_escenarios = {
-        'historical': 'Historical', 
-        'ssp245': 'SSP2 4.5', 
-        'ssp370': 'SSP3 7.0',
-        'ssp585': 'SSP5 8.5'
-    }
+                        'historical': 'Historical', 
+                        'ssp245': 'SSP2 4.5', 
+                        'ssp370': 'SSP3 7.0',
+                        'ssp585': 'SSP5 8.5'
+                    }
     
     # Agrupar por escenarios y modelos
     dtype_ssp_grouper = modelos.groupby(['Escenarios', 'Modelos', 'time_type'])
@@ -320,8 +384,15 @@ def main(url_nsa: str, assets: pd.DataFrame, path_storage: str) -> None:
 
     # Diccionario para almacenar resultados por escenario
     dict_escenarios = {}
+    reference_temp_dict = {
+                            'total_precipitaton_yearly': [] ,
+                            'longest_streak_result': [],
+                            'rolling_window_result': [],
+                            'count_days_result': []
+                            }
     
     for (escenario, modelo, dtype), df_type_escenario in dtype_ssp_grouper:
+            
         if dtype == 'datetime64[ns]':
             non_leap_year = False
         else:
@@ -330,6 +401,7 @@ def main(url_nsa: str, assets: pd.DataFrame, path_storage: str) -> None:
         escenario_format_name = maper_escenarios[escenario]
         folder_escenario = dict_escenarios.setdefault(escenario_format_name, {})
 
+        mean_time_dict = folder_escenario.setdefault('total_precipitaton_yearly', {})
         longest_streak_dict = folder_escenario.setdefault('longest_streak_result', {})
         rolling_window_dict = folder_escenario.setdefault('rolling_window_result', {})
         count_days_dict = folder_escenario.setdefault('count_days_result', {})
@@ -339,12 +411,23 @@ def main(url_nsa: str, assets: pd.DataFrame, path_storage: str) -> None:
         index_ssp = df_type_escenario.sort_values(by='Fold', ascending=True).index
         txt_name_ssp = np_arr[index_ssp]
 
-        ds_ssp = ensamble_folds('Colombia', txt_name_ssp, non_leap_year)
+        print("\n")
+        for enumerador,name_fold in enumerate(txt_name_ssp , start = 1):
+            print(f"\t{enumerador} - {name_fold }") 
+
+        ds_ssp = ensamble_folds(slice_crops,
+                                txt_name_ssp,
+                                non_leap_year,
+                                lon_name,
+                                lat_name
+                               )
         
         # AQUÍ ESTÁ LA MODIFICACIÓN CLAVE: Bifurcar el procesamiento según el escenario
         if escenario == 'historical':
             # PROCESAMIENTO PARA ESCENARIO HISTÓRICO
             print(f'\t\t{historical_start_year}-01-01 {historical_end_year}-12-31')
+
+            mean_time_list = mean_time_dict.setdefault(historical_range, [])
             longest_streak_list = longest_streak_dict.setdefault(historical_range, [])
             rolling_window_list = rolling_window_dict.setdefault(historical_range, [])
             count_days_list = count_days_dict.setdefault(historical_range, [])
@@ -355,42 +438,47 @@ def main(url_nsa: str, assets: pd.DataFrame, path_storage: str) -> None:
             
             # El resto del procesamiento es idéntico
             group = chunk_future.pr.resample(time='YE')
-            stat_temp = {
-                        'longest_streak_result': [],
-                        'rolling_window_result': [],
-                        'count_days_result': []
-                    }
+
+            stat_temp = reference_temp_dict.copy()
             
             for idx, (rango, slice_numpy) in enumerate(group.groups.items(), start=1):
+                
                 numba_raw = chunk_future.pr.values[slice_numpy] * 86_400
-                
+
                 # Apply the custom functions along axis 0
-                longest_streak_computation = np.apply_along_axis(longest_streak_above_threshold, axis=0, arr=numba_raw, threshold=1)
-                rolling_window_computation = np.apply_along_axis(rolling_window_max_precipitation, axis=0, arr=numba_raw, window_size=5)
-                count_days_computation = np.apply_along_axis(count_days_above_percentile, axis=0, arr=numba_raw, percentile=95)
+                sum_total_year = np.sum( numba_raw , axis = 0)
+                longest_streak_computation = np.apply_along_axis(longest_streak_above_threshold, axis=0, arr=numba_raw, threshold = 1)
+                rolling_window_computation = np.apply_along_axis(rolling_window_max_precipitation, axis=0, arr=numba_raw, window_size = 5)
+                count_days_computation = np.apply_along_axis(count_days_above_percentile, axis=0, arr=numba_raw, percentile = 95)
                 
+                stat_temp['total_precipitaton_yearly'].append(sum_total_year)
                 stat_temp['longest_streak_result'].append(longest_streak_computation)
                 stat_temp['rolling_window_result'].append(rolling_window_computation)
                 stat_temp['count_days_result'].append(count_days_computation)
-            
+
             # Procesamiento final para el período histórico
             for variable, list_numba in stat_temp.items():
-                stack_array = np.stack(list_numba, axis=0)
-                mean_var = np.quantile(a=stack_array,q = 0.9, axis=0)        
-                mean_var = mean_var[slice_tuple_2d]
                 
+                stack_array = np.stack(list_numba, axis=0)
+                mean_var_raster = np.mean(a = stack_array, axis=0)    
+
                 if variable == 'longest_streak_result':
-                    longest_streak_list.append(mean_var)
+                    longest_streak_list.append(mean_var_raster)
                 elif variable == 'rolling_window_result':
-                    rolling_window_list.append(mean_var)
+                    rolling_window_list.append(mean_var_raster)
                 elif variable == 'count_days_result':
-                    count_days_list.append(mean_var)
-            
+                    count_days_list.append(mean_var_raster)
+                elif variable == 'total_precipitaton_yearly':
+                    mean_time_list.append(mean_var_raster)
             print("Done Historical")
+            
         else:
             # PROCESAMIENTO PARA ESCENARIOS FUTUROS
             for (idx, ((start_year, end_year), horizon_code)) in enumerate(zip(time_ranges, time_ranges_str), start=1):
+                
                 print(f'\t\t{start_year}-01-01 {end_year}-12-31')
+
+                mean_time_list = mean_time_dict.setdefault(horizon_code, [])
                 longest_streak_list = longest_streak_dict.setdefault(horizon_code, [])
                 rolling_window_list = rolling_window_dict.setdefault(horizon_code, [])
                 count_days_list = count_days_dict.setdefault(horizon_code, [])
@@ -398,77 +486,54 @@ def main(url_nsa: str, assets: pd.DataFrame, path_storage: str) -> None:
                 # Select the data for the given time range
                 data_range = ds_ssp.sel(time=slice(f'{start_year}-01-01', f'{end_year}-12-31'))
                 chunk_future = data_range.compute()
-                
+
                 ### Recomensable no agrupar por año.
                 group = chunk_future.pr.resample(time='YE')
 
                 ## Diccionario temporal para realizar el promedio de las capas
-                stat_temp = {
-                                'longest_streak_result': [],
-                                'rolling_window_result': [],
-                                'count_days_result': []
-                            }
+                stat_temp = reference_temp_dict.copy()
+
                 for idx, (rango, slice_numpy) in enumerate(group.groups.items(), start=1):
+                    
                     numba_raw = chunk_future.pr.values[slice_numpy] * 86_400
-              
+                    
                     # Apply the custom functions along axis 0
+                    sum_total_year = np.sum( numba_raw , axis = 0)
                     longest_streak_computation = np.apply_along_axis(longest_streak_above_threshold, axis=0, arr=numba_raw, threshold=1)
                     rolling_window_computation = np.apply_along_axis(rolling_window_max_precipitation, axis=0, arr=numba_raw, window_size=5)
                     count_days_computation = np.apply_along_axis(count_days_above_percentile, axis=0, arr=numba_raw, percentile=95)
 
+                    stat_temp['total_precipitaton_yearly'].append(sum_total_year)
                     stat_temp['longest_streak_result'].append(longest_streak_computation)
                     stat_temp['rolling_window_result'].append(rolling_window_computation)
                     stat_temp['count_days_result'].append(count_days_computation)
                 
                 for variable, list_numba in stat_temp.items():
+                    
                     stack_array = np.stack(list_numba, axis=0)
-                    mean_var = np.quantile(a=stack_array,q = 0.9, axis=0)
-                    mean_var = mean_var[slice_tuple_2d]
+                    mean_var_raster = np.mean(a = stack_array, axis=0)
                     
                     if variable == 'longest_streak_result':
-                        longest_streak_list.append(mean_var)
+                        longest_streak_list.append(mean_var_raster)
                     elif variable == 'rolling_window_result':
-                        rolling_window_list.append(mean_var)
+                        rolling_window_list.append(mean_var_raster)
                     elif variable == 'count_days_result':
-                        count_days_list.append(mean_var)
+                        count_days_list.append(mean_var_raster)
+                    elif variable == 'total_precipitaton_yearly':
+                        mean_time_list.append(mean_var_raster)
 
                 print("Done")
 
-
-    # Procesamiento final para todos los escenarios
-    for escenario, stat_dict in dict_escenarios.items():
-        tortugaso = {}
-    
-        for stat_way, dict_horizon in stat_dict.items():
-            for horizon, list_to_stack in dict_horizon.items():
-                ## Ensamble entre modelos.
-                compute_var = np.mean(np.stack(list_to_stack, axis=1), axis=1)   
-                list_vars = tortugaso.setdefault(horizon, [])
-                list_vars.append(compute_var)
-
-        for temp_horizon, list_array in tortugaso.items():
-            current_col = f'{escenario}_{temp_horizon}_index'
-
-            index_matrix = np.stack(list_array, axis=1)
-
-            if index_matrix.shape[1] != 3:
-                print(index_matrix.shape[1])
-                print("Wrong")
-                return None
-                
-            mean_rain = np.mean(index_matrix, axis=1)  ### (RP95 + CWD + RXX) / 3
-            right_df = pd.DataFrame({
-                                    'lon_lat': cols_dict_db,
-                                    current_col: mean_rain
-                                })
-            dataset_assigment = dataset_assigment.merge(right=right_df, on='lon_lat', how='left')
-
-    print("Storing ...")
-    dataset_assigment.to_csv(os.path.join(path_storage, 'Resultados_CIGRE.csv'), index=False)
+    out = create_climate_geotiffs_from_dict(dict_escenarios, 
+                                             lon_coords, 
+                                             lat_coords, 
+                                             affine,
+                                             output_directory,
+                                             create_single_file = True)
  
     print("Done")
 
-    return None
+    return out, dataset_assigment
 
 ## Part 2 ## 
 ### CHIRPS V.2.0 ######  
